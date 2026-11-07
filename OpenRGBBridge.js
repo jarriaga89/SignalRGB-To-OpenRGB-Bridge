@@ -357,6 +357,7 @@ export function DiscoveryService() {
 	this.getUiState = function (pollToken) {
 		return JSON.stringify({
 			pollToken: String(pollToken === undefined ? "" : pollToken),
+			revision: this.uiStateRevision,
 			status: String(this.status || buildLookingForStatus()),
 			busy: !!this.busy,
 			devicesJson: String(this.deviceCatalogJson || "[]")

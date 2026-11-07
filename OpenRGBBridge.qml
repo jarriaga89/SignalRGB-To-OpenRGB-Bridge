@@ -6,6 +6,7 @@ Item {
     property bool busy: false
     property int activeCount: 0
     property int deletedCount: 0
+    property int lastUiRevision: 0
     property string deviceCatalogJson: ""
     property int pollRevision: 0
 
@@ -112,6 +113,9 @@ Item {
         // bridge. The service setting is an atomic, thread-safe state bus updated by
         // TCP callbacks without mutating SignalRGB's controller model.
         try {
+            if (typeof service.getSetting !== "function") {
+                throw "service.getSetting unavailable in this SignalRGB build"
+            }
             var rawState = service.getSetting("General", "UiState")
             var persistedState = toStateObject(rawState)
             if (pollRevision % 10 === 1) {
@@ -126,14 +130,21 @@ Item {
                 return
             }
         } catch (e) {
-            if (pollRevision % 10 === 1) {
-                logUi("[DIAG-UI] UiState read failed: " + String(e))
+            if (pollRevision === 1) {
+                logUi("[DIAG-UI] UiState route skipped: " + String(e))
             }
         }
 
         try {
-            var liveState = toStateObject(discovery.getUiState(pollRevision))
-            if (String(liveState.pollToken || "") === String(pollRevision)) {
+            var rawLive = discovery.getUiState(pollRevision)
+            var liveState = toStateObject(rawLive)
+            var liveRevision = Number(liveState.revision || 0)
+            var tokenOk = String(liveState.pollToken || "") === String(pollRevision)
+            if (pollRevision % 10 === 1) {
+                logUi("[DIAG-UI] live route: type=" + (typeof rawLive) + " tokenOk=" + tokenOk + " rev=" + liveRevision + " lastRev=" + lastUiRevision + " devicesType=" + (typeof liveState.devicesJson))
+            }
+            if (tokenOk || liveRevision > lastUiRevision) {
+                lastUiRevision = Math.max(lastUiRevision, liveRevision)
                 if (String(liveState.status || "") !== "") {
                     statusText = String(liveState.status)
                 }
@@ -142,6 +153,9 @@ Item {
                 return
             }
         } catch (e) {
+            if (pollRevision % 10 === 1) {
+                logUi("[DIAG-UI] live route failed: " + String(e))
+            }
         }
 
         var foundStatus = ""
@@ -155,11 +169,12 @@ Item {
                 if (!obj) {
                     continue
                 }
-                if (String(obj.id || "") === statusControllerId || obj.bridgeStatusBus) {
+                var isStatusBus = String(obj.id || "") === statusControllerId || obj.bridgeStatusBus === true
+                if (isStatusBus && typeof obj.bridgeDevicesJson === "string") {
                     haveStatusBus = true
-                    foundStatus = String(obj.bridgeStatus || "")
-                    foundDeviceCatalog = String(obj.bridgeDevicesJson || "[]")
-                    statusBusBusy = !!obj.bridgeBusy
+                    foundStatus = typeof obj.bridgeStatus === "string" ? obj.bridgeStatus : ""
+                    foundDeviceCatalog = obj.bridgeDevicesJson
+                    statusBusBusy = obj.bridgeBusy === true
                 }
             }
         } catch (e) {
