@@ -26,18 +26,52 @@ Item {
         }
     }
 
-    function updateDeviceModels(json) {
-        json = String(json || "[]")
+    // SignalRGB may hand values across the JS/QML bridge either as JSON text or as an
+    // already-converted array/object. Accept both instead of String()-ing an object.
+    function toStateObject(value) {
+        if (value && typeof value === "object") {
+            return value
+        }
+        return JSON.parse(String(value || "{}"))
+    }
+
+    function updateDeviceModels(value) {
+        var devices = []
+        var json = ""
+        if (value && typeof value === "object") {
+            devices = value
+            try {
+                json = JSON.stringify(value)
+            } catch (e) {
+                json = "object:" + String(value.length)
+            }
+        } else {
+            json = String(value || "[]")
+        }
+
         if (json === deviceCatalogJson) {
             return
         }
 
-        var devices = []
-        try {
-            devices = JSON.parse(json)
-        } catch (e) {
-            logUi("Failed to parse OpenRGB Bridge device catalogue: " + String(e))
-            return
+        if (typeof value !== "object" || value === null) {
+            try {
+                devices = JSON.parse(json)
+            } catch (e) {
+                // Remember the bad payload so the 500 ms poll does not re-log it forever.
+                deviceCatalogJson = json
+                logUi("Failed to parse OpenRGB Bridge device catalogue: " + String(e) + " | type=" + (typeof value) + " len=" + json.length + " start=" + json.slice(0, 200))
+                return
+            }
+        }
+
+        if (!Array.isArray(devices)) {
+            var list = []
+            if (devices && devices.length !== undefined) {
+                for (var k = 0; k < devices.length; k++) {
+                    list.push(devices[k])
+                }
+            }
+            devices = list
         }
 
         activeDeviceModel.clear()
@@ -78,25 +112,32 @@ Item {
         // bridge. The service setting is an atomic, thread-safe state bus updated by
         // TCP callbacks without mutating SignalRGB's controller model.
         try {
-            var persistedState = JSON.parse(String(service.getSetting("General", "UiState") || "{}"))
+            var rawState = service.getSetting("General", "UiState")
+            var persistedState = toStateObject(rawState)
+            if (pollRevision % 10 === 1) {
+                logUi("[DIAG-UI] poll " + pollRevision + ": UiState type=" + (typeof rawState) + " rev=" + Number(persistedState.revision || 0) + " devicesJsonLen=" + String(persistedState.devicesJson || "").length + " active=" + activeCount + " deleted=" + deletedCount)
+            }
             if (Number(persistedState.revision || 0) > 0) {
                 if (String(persistedState.status || "") !== "") {
                     statusText = String(persistedState.status)
                 }
-                updateDeviceModels(String(persistedState.devicesJson || "[]"))
+                updateDeviceModels(persistedState.devicesJson)
                 busy = !!persistedState.busy
                 return
             }
         } catch (e) {
+            if (pollRevision % 10 === 1) {
+                logUi("[DIAG-UI] UiState read failed: " + String(e))
+            }
         }
 
         try {
-            var liveState = JSON.parse(String(discovery.getUiState(pollRevision) || "{}"))
+            var liveState = toStateObject(discovery.getUiState(pollRevision))
             if (String(liveState.pollToken || "") === String(pollRevision)) {
                 if (String(liveState.status || "") !== "") {
                     statusText = String(liveState.status)
                 }
-                updateDeviceModels(String(liveState.devicesJson || "[]"))
+                updateDeviceModels(liveState.devicesJson)
                 busy = !!liveState.busy
                 return
             }
