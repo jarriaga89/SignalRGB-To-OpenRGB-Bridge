@@ -95,13 +95,6 @@ export function Initialize() {
 	deviceSetupFailed = false;
 	renderErrorLogged = false;
 	try {
-		try {
-			logFromDevice("[DIAG-DEV] scope: " + describeScope());
-			logFromDevice("[DIAG-DEV] device.Settings: " + describeObject(device.Settings));
-			logFromDevice("[DIAG-DEV] settings write: " + tryDeviceSettingWrite("device-" + Date.now()));
-		} catch (error) {
-			logFromDevice("[DIAG-DEV] context probe failed: " + error);
-		}
 		logFromDevice("[DIAG-DEV] controller: type=" + (typeof controller) +
 			" name=" + (typeof controller.name) + ":" + String(controller.name).slice(0, 60) +
 			" deviceId=" + (typeof controller.deviceId) +
@@ -138,7 +131,16 @@ export function Render() {
 	}
 }
 
-let framePublishLogged = false;
+// SignalRGB 2.5.86 gives addon devices no sockets and no memory shared with the
+// discovery service, but it does give them XMLHttpRequest. Frames go to the local
+// OpenRGB Bridge Helper (helper/OpenRGBBridgeHelper.ps1), which forwards them to OpenRGB.
+const HELPER_URL = "http://localhost:6748";
+const HELPER_RETRY_MS = 2000;
+let helperBusy = false;
+let helperPending = null;
+let helperRetryAt = 0;
+let helperErrorLogged = false;
+let helperOkLogged = false;
 
 function renderFrame() {
 	const stateKey = getRenderStateKey(controller);
@@ -146,32 +148,93 @@ function renderFrame() {
 	renderStates[stateKey] = state;
 
 	const frames = collectFrameColors(state);
-	let changed = false;
 	for (let i = 0; i < frames.length; i++) {
 		const signature = makeFrameSignature(frames[i].colors);
 		const signatureKey = String(frames[i].openrgbIndex);
 		if (signature !== state.lastFrameSignatures[signatureKey]) {
 			state.lastFrameSignatures[signatureKey] = signature;
-			changed = true;
+			queueHelperFrame(frames[i]);
 		}
 	}
 
-	if (changed) {
-		publishFrames(frames);
-	}
-
+	pumpHelper();
 	device.pause(16);
 }
 
-function publishFrames(frames) {
-	controller.bridgeFrames = frames.map(function (frame) {
-		return { openrgbIndex: frame.openrgbIndex, colors: frame.colors };
-	});
-	controller.bridgeFrameSeq = (typeof controller.bridgeFrameSeq === "number" ? controller.bridgeFrameSeq : 0) + 1;
-	controller.bridgeFrameJson = JSON.stringify({ seq: controller.bridgeFrameSeq, frames: controller.bridgeFrames });
-	if (!framePublishLogged) {
-		framePublishLogged = true;
-		logFromDevice("[DIAG-DEV] publishing frames to the bridge service; seq readback=" + (typeof controller.bridgeFrameSeq) + ":" + controller.bridgeFrameSeq);
+function queueHelperFrame(frame) {
+	helperPending = helperPending || {};
+	helperPending[String(frame.openrgbIndex)] = frame;   // latest frame per controller wins
+}
+
+function helperFrameUrl(frame) {
+	let hex = "";
+	for (let i = 0; i < frame.colors.length; i++) {
+		const color = normalizeColor(frame.colors[i]);
+		for (let c = 0; c < 3; c++) {
+			hex += ("0" + clampByte(color[c]).toString(16)).slice(-2);
+		}
+	}
+	const host = typeof controller.openrgbHost === "string" && controller.openrgbHost ? controller.openrgbHost : DEFAULT_HOST;
+	const port = typeof controller.openrgbPort === "number" ? controller.openrgbPort : DEFAULT_PORT;
+	return HELPER_URL + "/frame?h=" + encodeURIComponent(host) + "&p=" + port + "&i=" + frame.openrgbIndex + "&c=" + hex;
+}
+
+function pumpHelper() {
+	if (helperBusy || !helperPending || Date.now() < helperRetryAt) {
+		return;
+	}
+	if (typeof XMLHttpRequest === "undefined") {
+		if (!helperErrorLogged) {
+			helperErrorLogged = true;
+			logFromDevice("OpenRGB Bridge: this SignalRGB build offers devices no XMLHttpRequest; colours cannot be sent.");
+		}
+		helperPending = null;
+		return;
+	}
+
+	const keys = Object.keys(helperPending);
+	const frame = helperPending[keys[0]];
+	delete helperPending[keys[0]];
+	if (keys.length === 1) {
+		helperPending = null;
+	}
+
+	helperBusy = true;
+	const xhr = new XMLHttpRequest();
+	xhr.onreadystatechange = function () {
+		if (xhr.readyState !== 4) {
+			return;
+		}
+		helperBusy = false;
+		if (xhr.status === 200) {
+			if (!helperOkLogged || helperErrorLogged) {
+				logFromDevice("OpenRGB Bridge: sending colours through the helper at " + HELPER_URL + ".");
+			}
+			helperOkLogged = true;
+			helperErrorLogged = false;
+			return;
+		}
+
+		if (!helperErrorLogged) {
+			helperErrorLogged = true;
+			logFromDevice(xhr.status === 503
+				? "OpenRGB Bridge: the helper is running but cannot reach OpenRGB. Is OpenRGB's SDK server on?"
+				: "OpenRGB Bridge: no response from the helper at " + HELPER_URL + " (status " + xhr.status + "). Install or start the OpenRGB Bridge Helper.");
+		}
+		helperRetryAt = Date.now() + HELPER_RETRY_MS;
+		queueHelperFrame(frame);   // retry with the newest colours later
+	};
+	try {
+		xhr.open("GET", helperFrameUrl(frame), true);
+		xhr.send();
+	} catch (error) {
+		helperBusy = false;
+		helperRetryAt = Date.now() + HELPER_RETRY_MS;
+		queueHelperFrame(frame);
+		if (!helperErrorLogged) {
+			helperErrorLogged = true;
+			logFromDevice("OpenRGB Bridge: request to the helper failed: " + error);
+		}
 	}
 }
 
@@ -182,9 +245,12 @@ export function Shutdown() {
 	try {
 		const rgb = hexToRgb(shutdownColor);
 		const devices = controller.devices || [controller];
-		publishFrames(devices.map(function (item) {
-			return { openrgbIndex: item.openrgbIndex, colors: fillColors(getControllerLedCount(item), rgb) };
-		}));
+		for (let i = 0; i < devices.length; i++) {
+			queueHelperFrame({ openrgbIndex: devices[i].openrgbIndex, colors: fillColors(getControllerLedCount(devices[i]), rgb) });
+		}
+		helperBusy = false;
+		helperRetryAt = 0;
+		pumpHelper();
 	} catch (error) {
 		logFromDevice("[DIAG-DEV] Shutdown colour not published: " + error);
 	}
@@ -220,19 +286,7 @@ export function DiscoveryService() {
 	this.needsScan = true;
 	this.lastAutoAttemptAt = 0;
 
-	this.lastFrameSeq = {};
-	this.customModeSent = {};
-	this.customModeClient = undefined;
-	this.forwardedFrames = 0;
-	this.lastForwardLogAt = 0;
-
 	this.Initialize = function () {
-		try {
-			logFromService("[DIAG] service scope: " + describeScope());
-			logFromService("[DIAG] service object: " + describeObject(service));
-		} catch (error) {
-			logFromService("[DIAG] service context probe failed: " + error);
-		}
 		this.connectSelectedDevices();
 		// A discovery service with no registered controller is not guaranteed to receive
 		// Update() ticks in SignalRGB 2.5.76. Start the initial SDK discovery here so a
@@ -244,14 +298,6 @@ export function DiscoveryService() {
 
 	this.Update = function () {
 		this.flushControllerSync();
-		try {
-			this.pumpDeviceFrames();
-		} catch (error) {
-			if (!this.pumpErrorLogged) {
-				this.pumpErrorLogged = true;
-				logFromService("[DIAG] frame forwarding failed: " + error);
-			}
-		}
 		if (this.client) {
 			this.client.checkRequestTimeouts();
 			return;
@@ -270,93 +316,6 @@ export function DiscoveryService() {
 		const host = normalizeHost(readSetting(HOST_SETTING, DEFAULT_HOST));
 		const port = readNumberSetting(PORT_SETTING, DEFAULT_PORT);
 		this.refresh(host, port);
-	};
-
-	// Devices cannot open sockets on SignalRGB 2.5.86, so each device publishes its latest
-	// colours on its controller and the service sends them to OpenRGB.
-	this.pumpDeviceFrames = function () {
-		const entries = service.controllers || [];
-		const now = Date.now();
-		const logView = now - (this.lastPumpViewLogAt || 0) > 10000;
-		if (logView) {
-			this.lastPumpViewLogAt = now;
-		}
-		for (let i = 0; i < entries.length; i++) {
-			const entryObj = entries[i] && entries[i].obj;
-			const entryId = entryObj ? String(entryObj.deviceId || entryObj.id || entries[i].id || i) : String(entries[i] && entries[i].id);
-			const looked = typeof service.getController === "function" ? service.getController(entryId) : undefined;
-			const obj = (looked && typeof looked === "object") ? looked : entryObj;
-			if (!obj || typeof obj !== "object") {
-				continue;
-			}
-
-			let seq = obj.bridgeFrameSeq;
-			let frames = obj.bridgeFrames;
-			if (typeof obj.bridgeFrameJson === "string" && obj.bridgeFrameJson !== "") {
-				try {
-					const parsed = JSON.parse(obj.bridgeFrameJson);
-					seq = parsed.seq;
-					frames = parsed.frames;
-				} catch (_) {
-				}
-			}
-
-			if (logView) {
-				let probe;
-				try {
-					probe = String(readSetting(PROBE_SETTING, "<none>"));
-				} catch (error) {
-					probe = "read failed: " + error;
-				}
-				logFromService("[DIAG] settings probe seen by service: " + probe.slice(0, 80) +
-					" | userProperty on controller: " + (typeof obj.bridgeProbe) + ":" + String(obj.bridgeProbe).slice(0, 40));
-				logFromService("[DIAG] pump view " + entryId + ": seq=" + (typeof seq) + ":" + seq +
-					" json=" + (typeof obj.bridgeFrameJson) + ":" + String(obj.bridgeFrameJson || "").length +
-					" sameObj=" + (looked === entryObj) + " forwarded=" + this.forwardedFrames);
-			}
-
-			if (typeof seq !== "number" || seq === 0) {
-				continue;
-			}
-			const id = entryId;
-			if (this.lastFrameSeq[id] === seq) {
-				continue;
-			}
-
-			const client = ensureRenderClient(obj, logFromService);
-			if (!client) {
-				continue;
-			}
-			client.ensureConnected();
-			if (!client.isReady()) {
-				continue;
-			}
-			if (this.customModeClient !== client) {
-				this.customModeClient = client;
-				this.customModeSent = {};
-			}
-
-			frames = frames || [];
-			for (let f = 0; f < frames.length; f++) {
-				const frame = frames[f];
-				const key = String(frame.openrgbIndex);
-				if (!this.customModeSent[key]) {
-					client.setCustomMode(frame.openrgbIndex);
-					this.customModeSent[key] = true;
-				}
-				client.updateLeds(frame.openrgbIndex, frame.colors);
-			}
-			if (this.forwardedFrames === 0) {
-				logFromService("[DIAG] first frame forwarded to OpenRGB for " + (obj.name || id) + " (" + frames.length + " zone frame(s)).");
-			}
-			this.lastFrameSeq[id] = seq;
-			this.forwardedFrames++;
-		}
-
-		if (this.forwardedFrames > 0 && now - this.lastForwardLogAt > 30000) {
-			this.lastForwardLogAt = now;
-			logFromService("[DIAG] frames forwarded so far: " + this.forwardedFrames);
-		}
 	};
 
 	this.refresh = function (host, port) {
@@ -863,11 +822,6 @@ class OpenRGBController {
 		// Tracks whether SignalRGB should announce or suppress this controller. QML gets
 		// its independent active/deleted snapshot from the status-carrier catalogue.
 		this.bridgeDeleted = !!deviceData.bridgeDeleted;
-		// Frame handoff from the device context. Declared up front: SignalRGB may only
-		// share properties that exist when the controller is announced.
-		this.bridgeFrameSeq = 0;
-		this.bridgeFrames = [];
-		this.bridgeFrameJson = "";
 	}
 
 	updateWithValue(deviceData) {
@@ -2299,114 +2253,6 @@ function clampByte(value) {
 }
 
 // Reports which communication primitives exist in the current SignalRGB context.
-function describeScope() {
-	const kinds = [];
-	const add = function (name, fn) {
-		let kind;
-		try {
-			kind = fn();
-		} catch (error) {
-			kind = "throws";
-		}
-		kinds.push(name + "=" + kind);
-	};
-	add("tcp", function () { return typeof tcp + (tcp ? "(" + typeof tcp.createSocket + ")" : ""); });
-	add("XMLHttpRequest", function () { return typeof XMLHttpRequest; });
-	add("WebSocket", function () { return typeof WebSocket; });
-	add("fetch", function () { return typeof fetch; });
-	add("udp", function () { return typeof udp; });
-	add("service", function () { return typeof service; });
-	add("Promise", function () { return typeof Promise; });
-	add("setTimeout", function () { return typeof setTimeout; });
-	return kinds.join(" ");
-}
-
-function describeObject(value) {
-	if (value === undefined || value === null) {
-		return String(value);
-	}
-	let keys = [];
-	try {
-		const proto = Object.getPrototypeOf(value);
-		keys = Object.getOwnPropertyNames(value).concat(proto ? Object.getOwnPropertyNames(proto) : []);
-	} catch (error) {
-		return typeof value + " (keys unavailable: " + error + ")";
-	}
-	return typeof value + " {" + keys.filter(function (k) {
-		return !/^(constructor|toString|toLocaleString|valueOf|hasOwnProperty|isPrototypeOf|propertyIsEnumerable|__.*)$/.test(k);
-	}).slice(0, 50).join(",") + "}";
-}
-
-// Settings round trip: the device writes a marker, the service reads it back.
-const PROBE_SETTING = "DeviceProbe";
-
-function tryDeviceSettingWrite(value) {
-	const results = [];
-	const settings = device.Settings;
-	const attempts = [
-		["Settings.setValue", function () { settings.setValue(SETTINGS_GROUP + "/" + PROBE_SETTING, value); }],
-		["Settings.saveSetting", function () { settings.saveSetting(SETTINGS_GROUP, PROBE_SETTING, value); }],
-		["Settings.set", function () { settings.set(PROBE_SETTING, value); }],
-		["device.saveSetting", function () { device.saveSetting(SETTINGS_GROUP, PROBE_SETTING, value); }],
-		["device.addProperty", function () { device.addProperty({ property: "bridgeProbe", type: "textfield", default: value, label: "bridgeProbe" }); }],
-		["device.setUserProperty", function () { device.setUserProperty("bridgeProbe", value); }]
-	];
-	for (let i = 0; i < attempts.length; i++) {
-		try {
-			attempts[i][1]();
-			results.push(attempts[i][0] + "=ok");
-		} catch (error) {
-			results.push(attempts[i][0] + "=" + String(error).slice(0, 60));
-		}
-	}
-	return results.join(" ");
-}
-
-function describeContext() {
-	const g = (typeof globalThis !== "undefined") ? globalThis : {};
-	const names = ["tcp", "udp", "XMLHttpRequest", "WebSocket", "fetch", "service", "device", "controller",
-		"discovery", "Qt", "require", "setTimeout", "setInterval", "Promise", "localStorage"];
-	const parts = names.map(function (name) {
-		let kind;
-		try {
-			kind = typeof g[name];
-		} catch (error) {
-			kind = "throws";
-		}
-		return name + "=" + kind;
-	});
-	let globalsList = "";
-	try {
-		globalsList = Object.getOwnPropertyNames(g).filter(function (name) {
-			return names.indexOf(name) < 0 && !/^(Object|Function|Array|Number|parseFloat|parseInt|Infinity|NaN|undefined|Boolean|String|Symbol|Date|RegExp|Error|EvalError|RangeError|ReferenceError|SyntaxError|TypeError|URIError|JSON|Math|Intl|ArrayBuffer|Uint8Array|Int8Array|Uint16Array|Int16Array|Uint32Array|Int32Array|Float32Array|Float64Array|Uint8ClampedArray|DataView|Map|Set|WeakMap|WeakSet|Proxy|Reflect|isNaN|isFinite|decodeURI|decodeURIComponent|encodeURI|encodeURIComponent|escape|unescape|eval|globalThis|SharedArrayBuffer|Atomics|AggregateError|WeakRef|FinalizationRegistry|BigInt|BigInt64Array|BigUint64Array)$/.test(name);
-		}).slice(0, 60).join(",");
-	} catch (error) {
-		globalsList = "unavailable: " + error;
-	}
-	let deviceApi = "";
-	try {
-		if (typeof device !== "undefined" && device) {
-			const proto = Object.getPrototypeOf(device);
-			const keys = Object.getOwnPropertyNames(device).concat(proto ? Object.getOwnPropertyNames(proto) : []);
-			deviceApi = keys.filter(function (k) {
-				return /udp|tcp|socket|http|net|send|setting|property|service|message|ipc|shared|global|store|write|read/i.test(k);
-			}).slice(0, 40).join(",");
-		}
-	} catch (error) {
-		deviceApi = "unavailable: " + error;
-	}
-	let serviceApi = "";
-	try {
-		if (typeof service !== "undefined" && service) {
-			const proto = Object.getPrototypeOf(service);
-			serviceApi = Object.getOwnPropertyNames(service).concat(proto ? Object.getOwnPropertyNames(proto) : []).slice(0, 60).join(",");
-		}
-	} catch (error) {
-		serviceApi = "unavailable: " + error;
-	}
-	return parts.join(" ") + " | other globals: " + globalsList + " | device api: " + deviceApi + " | service api: " + serviceApi;
-}
-
 function logFromDevice(message) {
 	if (typeof device !== "undefined" && device.log) {
 		device.log(message);

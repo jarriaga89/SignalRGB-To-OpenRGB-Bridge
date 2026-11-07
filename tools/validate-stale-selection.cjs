@@ -204,7 +204,7 @@ fresh.needsScan = false;
 runScan(fresh);
 assert.equal(catalogue(fresh)[0].bridgeDeleted, true, "Delete All must persist across restarts");
 
-// ---- Device -> service frame handoff (devices cannot open sockets on 2.5.86) ----
+// ---- Device -> local helper over HTTP (devices have no sockets on 2.5.86) ----
 discovery.restoreAllDevices();
 discovery.Update();
 runScan(discovery);
@@ -215,27 +215,44 @@ Object.assign(context.device, {
 	subdeviceColor(id) { return id.endsWith("Logo") ? [255, 0, 0] : [0, 0, 255]; },
 	color() { return [0, 255, 0]; }
 });
+const requests = [];
+let respond = 200;
+context.XMLHttpRequest = function () {
+	const xhr = this;
+	xhr.readyState = 0;
+	xhr.open = function (method, url) { xhr.method = method; xhr.url = url; };
+	xhr.send = function () {
+		requests.push(xhr.url);
+		xhr.readyState = 4;
+		xhr.status = respond;
+		xhr.onreadystatechange();
+	};
+};
 context.controller = gpuController;
 Object.assign(context, { LightingMode: "Canvas", forcedColor: "#009bde", shutdownColor: "#009bde" });
-context.device.log = (m) => { if (String(m).includes("DIAG-DEV")) console.log(String(m).slice(0, 300)); };
+context.device.log = (m) => { if (String(m).includes("OpenRGB Bridge:")) console.log("  device:", String(m)); };
 context.__bridgeTest.Initialize();
 context.__bridgeTest.Render();
-assert.equal(typeof gpuController.bridgeFrameSeq, "number", "the device must publish its frame on the controller");
-assert.equal(gpuController.bridgeFrames.length, 1, "both zones belong to one OpenRGB controller");
-assert.equal(JSON.stringify(gpuController.bridgeFrames[0].colors), JSON.stringify([[255, 0, 0], [0, 0, 255]]), "the frame carries each zone's canvas colour");
+assert.equal(requests.length, 1, "a changed frame must be sent to the helper");
+assert.equal(requests[0], "http://localhost:6748/frame?h=127.0.0.1&p=6742&i=0&c=ff00000000ff",
+	"the request must carry OpenRGB host, port, controller index and both zone colours");
 
-const socketsBefore = sockets.length;
-discovery.Update();                              // service opens its render connection
-const renderSocket = sockets[sockets.length - 1];
-assert.ok(sockets.length > socketsBefore, "the service must open the render connection, not the device");
-renderSocket.handlers.connection();
-renderSocket.handlers.message(packet(40, u32(6)));
-discovery.Update();                              // ready: custom mode + LED updates go out
-const commands = renderSocket.sent.map((bytes) => bytes[8] | (bytes[9] << 8) | (bytes[10] << 16) | (bytes[11] << 24));
-assert.ok(commands.includes(1100), "the service must switch the GPU to custom mode");
-assert.ok(commands.includes(1050), "the service must send the GPU's LED colours to OpenRGB");
-const sentBefore = renderSocket.sent.length;
-discovery.Update();
-assert.equal(renderSocket.sent.length, sentBefore, "an unchanged frame must not be resent");
+context.__bridgeTest.Render();
+assert.equal(requests.length, 1, "an unchanged frame must not be resent");
+
+// helper down: one log, backoff, newest colours resent after recovery
+context.device.subdeviceColor = (id) => (id.endsWith("Logo") ? [0, 255, 0] : [0, 0, 255]);
+respond = 0;
+context.__bridgeTest.Render();
+assert.equal(requests.length, 2, "the new frame is attempted once");
+context.__bridgeTest.Render();
+assert.equal(requests.length, 2, "no retry before the backoff expires");
+respond = 200;
+const realNow = Date.now;
+context.Date = { now: () => realNow() + 5000 };
+context.__bridgeTest.Render();
+context.Date = Date;
+assert.equal(requests.length, 3, "the pending frame is retried after the backoff");
+assert.match(requests[2], /c=00ff000000ff$/, "the retry carries the newest colours");
 
 console.log("Stale-selection validation passed.");
