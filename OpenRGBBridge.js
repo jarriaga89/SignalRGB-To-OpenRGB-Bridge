@@ -82,16 +82,51 @@ let renderClient;
 let renderClientKey = "";
 let renderStates = {};
 
-export function Initialize() {
-	device.setName(controller.name || "OpenRGB Device");
-	device.setImageFromUrl(controller.image || ICON_URL);
+let deviceSetupFailed = false;
+let renderErrorLogged = false;
 
-	const stateKey = getRenderStateKey(controller);
-	renderStates[stateKey] = buildSignalRgbLayout(controller);
-	ensureRenderClient(controller, logFromDevice);
+export function Initialize() {
+	deviceSetupFailed = false;
+	renderErrorLogged = false;
+	try {
+		logFromDevice("[DIAG-DEV] controller: type=" + (typeof controller) +
+			" name=" + (typeof controller.name) + ":" + String(controller.name).slice(0, 60) +
+			" deviceId=" + (typeof controller.deviceId) +
+			" zones=" + (Array.isArray(controller.zones) ? controller.zones.length : typeof controller.zones) +
+			" leds=" + (Array.isArray(controller.leds) ? controller.leds.length : typeof controller.leds) +
+			" host=" + (typeof controller.openrgbHost) + " index=" + (typeof controller.openrgbIndex));
+
+		device.setName(typeof controller.name === "string" && controller.name ? controller.name : "OpenRGB Device");
+		device.setImageFromUrl(typeof controller.image === "string" && controller.image ? controller.image : ICON_URL);
+
+		const stateKey = getRenderStateKey(controller);
+		renderStates[stateKey] = buildSignalRgbLayout(controller);
+		ensureRenderClient(controller, logFromDevice);
+		logFromDevice("[DIAG-DEV] Initialize finished");
+	} catch (error) {
+		deviceSetupFailed = true;
+		logFromDevice("[DIAG-DEV] Initialize FAILED: " + error + (error && error.stack ? " | " + error.stack : ""));
+	}
 }
 
 export function Render() {
+	if (deviceSetupFailed) {
+		// Do not rebuild a broken layout 60 times a second; that grows CPU use over time.
+		device.pause(1000);
+		return;
+	}
+	try {
+		renderFrame();
+	} catch (error) {
+		if (!renderErrorLogged) {
+			renderErrorLogged = true;
+			logFromDevice("[DIAG-DEV] Render FAILED (further errors suppressed): " + error + (error && error.stack ? " | " + error.stack : ""));
+		}
+		device.pause(1000);
+	}
+}
+
+function renderFrame() {
 	const client = ensureRenderClient(controller, logFromDevice);
 	if (!client) {
 		return;
@@ -491,7 +526,6 @@ export function DiscoveryService() {
 		}
 
 		const json = JSON.stringify(rows);
-		logFromService("[DIAG] catalog: " + rows.length + " row(s), active=" + rows.filter(function (r) { return !r.bridgeDeleted; }).length + " selected=" + selectedIds.length + " -> " + json.slice(0, 400));
 		if (this.deviceCatalogJson === json) {
 			return;
 		}
@@ -507,7 +541,6 @@ export function DiscoveryService() {
 		// SignalRGB 2.5.76 does not tick Update() while a discovery service has no
 		// registered controllers. Defer the mutation out of the TCP/QML callback so the
 		// first discovered (or restored) controllers can bootstrap normal Update ticks.
-		logFromService("[DIAG] requestControllerSync: setTimeout available=" + (typeof setTimeout === "function"));
 		if (typeof setTimeout === "function") {
 			if (this.controllerSyncTimer !== undefined && typeof clearTimeout === "function") {
 				clearTimeout(this.controllerSyncTimer);
@@ -534,7 +567,6 @@ export function DiscoveryService() {
 		try {
 			logFromService("[DIAG] syncControllers starting");
 			this.syncControllers();
-			this.publishUiStateToControllers();
 			logFromService("[DIAG] syncControllers finished; service.controllers=" + ((service.controllers || []).length));
 		} catch (error) {
 			logFromService("[DIAG] syncControllers FAILED: " + error + (error && error.stack ? " | " + error.stack : ""));
@@ -658,31 +690,8 @@ export function DiscoveryService() {
 		return this.status;
 	};
 
-	// SignalRGB 2.5.77+ does not pass discovery-method return values or settings to QML,
-	// but QML can read properties of registered controllers. Mirror the UI state there.
-	this.publishUiStateToControllers = function () {
-		const entries = service.controllers || [];
-		for (let i = 0; i < entries.length; i++) {
-			const obj = entries[i] && entries[i].obj;
-			if (!obj || typeof obj !== "object") {
-				continue;
-			}
-			obj.bridgeStatusBus = true;
-			obj.bridgeStatus = String(this.status || buildLookingForStatus());
-			obj.bridgeBusy = !!this.busy;
-			obj.bridgeDevicesJson = String(this.deviceCatalogJson || "[]");
-			obj.bridgeUiRevision = this.uiStateRevision;
-		}
-	};
-
 	this.persistUiState = function () {
 		this.uiStateRevision++;
-		try {
-			this.publishUiStateToControllers();
-		} catch (error) {
-			logFromService("[DIAG] publishUiStateToControllers failed: " + error);
-		}
-		logFromService("[DIAG] persistUiState rev=" + this.uiStateRevision + " catalogLen=" + String(this.deviceCatalogJson || "[]").length);
 		saveSetting(UI_STATE_SETTING, JSON.stringify({
 			revision: this.uiStateRevision,
 			status: String(this.status || buildLookingForStatus()),

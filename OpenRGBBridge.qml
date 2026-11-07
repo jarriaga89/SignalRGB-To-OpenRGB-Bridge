@@ -169,17 +169,14 @@ Item {
                 if (!obj) {
                     continue
                 }
-                var isStatusBus = String(obj.id || "") === statusControllerId || obj.bridgeStatusBus === true
-                if (isStatusBus && typeof obj.bridgeDevicesJson === "string") {
-                    haveStatusBus = true
-                    foundStatus = typeof obj.bridgeStatus === "string" ? obj.bridgeStatus : ""
-                    foundDeviceCatalog = obj.bridgeDevicesJson
-                    statusBusBusy = obj.bridgeBusy === true
-                    break
+                if (String(obj.id || "") !== statusControllerId || typeof obj.bridgeDevicesJson !== "string") {
+                    continue
                 }
-                if (pollRevision % 10 === 1 && i === 0) {
-                    logUi("[DIAG-UI] controller route: id=" + String(obj.id) + " busType=" + (typeof obj.bridgeStatusBus) + " devicesType=" + (typeof obj.bridgeDevicesJson))
-                }
+                haveStatusBus = true
+                foundStatus = typeof obj.bridgeStatus === "string" ? obj.bridgeStatus : ""
+                foundDeviceCatalog = obj.bridgeDevicesJson
+                statusBusBusy = obj.bridgeBusy === true
+                break
             }
         } catch (e) {
             busy = readBusy()
