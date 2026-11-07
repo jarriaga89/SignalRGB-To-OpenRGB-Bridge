@@ -486,6 +486,7 @@ export function DiscoveryService() {
 		}
 
 		const json = JSON.stringify(rows);
+		logFromService("[DIAG] catalog: " + rows.length + " row(s), active=" + rows.filter(function (r) { return !r.bridgeDeleted; }).length + " selected=" + selectedIds.length + " -> " + json.slice(0, 400));
 		if (this.deviceCatalogJson === json) {
 			return;
 		}
@@ -501,6 +502,7 @@ export function DiscoveryService() {
 		// SignalRGB 2.5.76 does not tick Update() while a discovery service has no
 		// registered controllers. Defer the mutation out of the TCP/QML callback so the
 		// first discovered (or restored) controllers can bootstrap normal Update ticks.
+		logFromService("[DIAG] requestControllerSync: setTimeout available=" + (typeof setTimeout === "function"));
 		if (typeof setTimeout === "function") {
 			if (this.controllerSyncTimer !== undefined && typeof clearTimeout === "function") {
 				clearTimeout(this.controllerSyncTimer);
@@ -525,7 +527,11 @@ export function DiscoveryService() {
 		this.controllersDirty = false;
 		this.syncingControllers = true;
 		try {
+			logFromService("[DIAG] syncControllers starting");
 			this.syncControllers();
+			logFromService("[DIAG] syncControllers finished; service.controllers=" + ((service.controllers || []).length));
+		} catch (error) {
+			logFromService("[DIAG] syncControllers FAILED: " + error + (error && error.stack ? " | " + error.stack : ""));
 		} finally {
 			this.syncingControllers = false;
 		}
@@ -594,6 +600,7 @@ export function DiscoveryService() {
 		const deviceId = deviceData.deviceId;
 		let controller = service.getController(deviceId);
 
+		logFromService("[DIAG] applyController " + deviceId + " active=" + active + " existing=" + (controller !== undefined));
 		if (!active) {
 			deviceData.bridgeDeleted = true;
 			closeRenderState(deviceId);
@@ -628,9 +635,12 @@ export function DiscoveryService() {
 			service.removeController(controller);
 		}
 
+		logFromService("[DIAG] applyController new: " + deviceId + " name=" + deviceData.name + " leds=" + getControllerLedCount(deviceData) + " zones=" + (deviceData.zones ? deviceData.zones.length : 0) + " type=" + deviceData.type);
 		controller = new OpenRGBController(deviceData);
 		service.addController(controller);
+		logFromService("[DIAG] addController ok");
 		service.announceController(controller);
+		logFromService("[DIAG] announceController ok");
 
 		return deviceId;
 	};
@@ -644,6 +654,7 @@ export function DiscoveryService() {
 
 	this.persistUiState = function () {
 		this.uiStateRevision++;
+		logFromService("[DIAG] persistUiState rev=" + this.uiStateRevision + " catalogLen=" + String(this.deviceCatalogJson || "[]").length);
 		saveSetting(UI_STATE_SETTING, JSON.stringify({
 			revision: this.uiStateRevision,
 			status: String(this.status || buildLookingForStatus()),
