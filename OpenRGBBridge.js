@@ -95,6 +95,11 @@ export function Initialize() {
 	deviceSetupFailed = false;
 	renderErrorLogged = false;
 	try {
+		try {
+			logFromDevice("[DIAG-DEV] context: " + describeContext());
+		} catch (error) {
+			logFromDevice("[DIAG-DEV] context probe failed: " + error);
+		}
 		logFromDevice("[DIAG-DEV] controller: type=" + (typeof controller) +
 			" name=" + (typeof controller.name) + ":" + String(controller.name).slice(0, 60) +
 			" deviceId=" + (typeof controller.deviceId) +
@@ -220,6 +225,11 @@ export function DiscoveryService() {
 	this.lastForwardLogAt = 0;
 
 	this.Initialize = function () {
+		try {
+			logFromService("[DIAG] service context: " + describeContext());
+		} catch (error) {
+			logFromService("[DIAG] service context probe failed: " + error);
+		}
 		this.connectSelectedDevices();
 		// A discovery service with no registered controller is not guaranteed to receive
 		// Update() ticks in SignalRGB 2.5.76. Start the initial SDK discovery here so a
@@ -2275,6 +2285,52 @@ function clampByte(value) {
 		return 255;
 	}
 	return Math.floor(parsed);
+}
+
+// Reports which communication primitives exist in the current SignalRGB context.
+function describeContext() {
+	const g = (typeof globalThis !== "undefined") ? globalThis : {};
+	const names = ["tcp", "udp", "XMLHttpRequest", "WebSocket", "fetch", "service", "device", "controller",
+		"discovery", "Qt", "require", "setTimeout", "setInterval", "Promise", "localStorage"];
+	const parts = names.map(function (name) {
+		let kind;
+		try {
+			kind = typeof g[name];
+		} catch (error) {
+			kind = "throws";
+		}
+		return name + "=" + kind;
+	});
+	let globalsList = "";
+	try {
+		globalsList = Object.getOwnPropertyNames(g).filter(function (name) {
+			return names.indexOf(name) < 0 && !/^(Object|Function|Array|Number|parseFloat|parseInt|Infinity|NaN|undefined|Boolean|String|Symbol|Date|RegExp|Error|EvalError|RangeError|ReferenceError|SyntaxError|TypeError|URIError|JSON|Math|Intl|ArrayBuffer|Uint8Array|Int8Array|Uint16Array|Int16Array|Uint32Array|Int32Array|Float32Array|Float64Array|Uint8ClampedArray|DataView|Map|Set|WeakMap|WeakSet|Proxy|Reflect|isNaN|isFinite|decodeURI|decodeURIComponent|encodeURI|encodeURIComponent|escape|unescape|eval|globalThis|SharedArrayBuffer|Atomics|AggregateError|WeakRef|FinalizationRegistry|BigInt|BigInt64Array|BigUint64Array)$/.test(name);
+		}).slice(0, 60).join(",");
+	} catch (error) {
+		globalsList = "unavailable: " + error;
+	}
+	let deviceApi = "";
+	try {
+		if (typeof device !== "undefined" && device) {
+			const proto = Object.getPrototypeOf(device);
+			const keys = Object.getOwnPropertyNames(device).concat(proto ? Object.getOwnPropertyNames(proto) : []);
+			deviceApi = keys.filter(function (k) {
+				return /udp|tcp|socket|http|net|send|setting|property|service|message|ipc|shared|global|store|write|read/i.test(k);
+			}).slice(0, 40).join(",");
+		}
+	} catch (error) {
+		deviceApi = "unavailable: " + error;
+	}
+	let serviceApi = "";
+	try {
+		if (typeof service !== "undefined" && service) {
+			const proto = Object.getPrototypeOf(service);
+			serviceApi = Object.getOwnPropertyNames(service).concat(proto ? Object.getOwnPropertyNames(proto) : []).slice(0, 60).join(",");
+		}
+	} catch (error) {
+		serviceApi = "unavailable: " + error;
+	}
+	return parts.join(" ") + " | other globals: " + globalsList + " | device api: " + deviceApi + " | service api: " + serviceApi;
 }
 
 function logFromDevice(message) {
