@@ -161,6 +161,7 @@ function publishFrames(frames) {
 		return { openrgbIndex: frame.openrgbIndex, colors: frame.colors };
 	});
 	controller.bridgeFrameSeq = (typeof controller.bridgeFrameSeq === "number" ? controller.bridgeFrameSeq : 0) + 1;
+	controller.bridgeFrameJson = JSON.stringify({ seq: controller.bridgeFrameSeq, frames: controller.bridgeFrames });
 	if (!framePublishLogged) {
 		framePublishLogged = true;
 		logFromDevice("[DIAG-DEV] publishing frames to the bridge service; seq readback=" + (typeof controller.bridgeFrameSeq) + ":" + controller.bridgeFrameSeq);
@@ -262,13 +263,42 @@ export function DiscoveryService() {
 	// colours on its controller and the service sends them to OpenRGB.
 	this.pumpDeviceFrames = function () {
 		const entries = service.controllers || [];
+		const now = Date.now();
+		const logView = now - (this.lastPumpViewLogAt || 0) > 10000;
+		if (logView) {
+			this.lastPumpViewLogAt = now;
+		}
 		for (let i = 0; i < entries.length; i++) {
-			const obj = entries[i] && entries[i].obj;
-			if (!obj || typeof obj !== "object" || typeof obj.bridgeFrameSeq !== "number") {
+			const entryObj = entries[i] && entries[i].obj;
+			const entryId = entryObj ? String(entryObj.deviceId || entryObj.id || entries[i].id || i) : String(entries[i] && entries[i].id);
+			const looked = typeof service.getController === "function" ? service.getController(entryId) : undefined;
+			const obj = (looked && typeof looked === "object") ? looked : entryObj;
+			if (!obj || typeof obj !== "object") {
 				continue;
 			}
-			const id = String(obj.deviceId || obj.id || i);
-			if (this.lastFrameSeq[id] === obj.bridgeFrameSeq) {
+
+			let seq = obj.bridgeFrameSeq;
+			let frames = obj.bridgeFrames;
+			if (typeof obj.bridgeFrameJson === "string" && obj.bridgeFrameJson !== "") {
+				try {
+					const parsed = JSON.parse(obj.bridgeFrameJson);
+					seq = parsed.seq;
+					frames = parsed.frames;
+				} catch (_) {
+				}
+			}
+
+			if (logView) {
+				logFromService("[DIAG] pump view " + entryId + ": seq=" + (typeof seq) + ":" + seq +
+					" json=" + (typeof obj.bridgeFrameJson) + ":" + String(obj.bridgeFrameJson || "").length +
+					" sameObj=" + (looked === entryObj) + " forwarded=" + this.forwardedFrames);
+			}
+
+			if (typeof seq !== "number" || seq === 0) {
+				continue;
+			}
+			const id = entryId;
+			if (this.lastFrameSeq[id] === seq) {
 				continue;
 			}
 
@@ -285,7 +315,7 @@ export function DiscoveryService() {
 				this.customModeSent = {};
 			}
 
-			const frames = obj.bridgeFrames || [];
+			frames = frames || [];
 			for (let f = 0; f < frames.length; f++) {
 				const frame = frames[f];
 				const key = String(frame.openrgbIndex);
@@ -298,11 +328,10 @@ export function DiscoveryService() {
 			if (this.forwardedFrames === 0) {
 				logFromService("[DIAG] first frame forwarded to OpenRGB for " + (obj.name || id) + " (" + frames.length + " zone frame(s)).");
 			}
-			this.lastFrameSeq[id] = obj.bridgeFrameSeq;
+			this.lastFrameSeq[id] = seq;
 			this.forwardedFrames++;
 		}
 
-		const now = Date.now();
 		if (this.forwardedFrames > 0 && now - this.lastForwardLogAt > 30000) {
 			this.lastForwardLogAt = now;
 			logFromService("[DIAG] frames forwarded so far: " + this.forwardedFrames);
@@ -813,6 +842,11 @@ class OpenRGBController {
 		// Tracks whether SignalRGB should announce or suppress this controller. QML gets
 		// its independent active/deleted snapshot from the status-carrier catalogue.
 		this.bridgeDeleted = !!deviceData.bridgeDeleted;
+		// Frame handoff from the device context. Declared up front: SignalRGB may only
+		// share properties that exist when the controller is announced.
+		this.bridgeFrameSeq = 0;
+		this.bridgeFrames = [];
+		this.bridgeFrameJson = "";
 	}
 
 	updateWithValue(deviceData) {
