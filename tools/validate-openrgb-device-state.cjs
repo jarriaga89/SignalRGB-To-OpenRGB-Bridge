@@ -138,12 +138,11 @@ vm.runInContext(source, context, { filename: bridgePath });
 
 assert.match(qmlSource, /discovery\.getUiState\(pollRevision\)/, "QML must poll the live cache-busted state method");
 assert.match(qmlSource, /service\.getSetting\("General", "UiState"\)/, "QML must read the persisted cross-thread UI state");
-assert.doesNotMatch(
+assert.match(
 	rawSource,
-	/^import\s+.*@SignalRGB\/tcp/m,
-	"the plugin must not statically import @SignalRGB/tcp (SignalRGB 2.5.86 device contexts cannot resolve it)"
+	/^import tcp from "@SignalRGB\/tcp";/m,
+	"the discovery service must statically import SignalRGB's TCP module (runtime import() is a parse error)"
 );
-assert.match(rawSource, /dynamicImport\("@SignalRGB\/tcp"\)/, "the discovery service must load TCP at runtime");
 assert.doesNotMatch(source, /statusController\s*=/, "the discovery service must not register a synthetic status controller");
 assert.match(rawSource, /setSubdeviceLeds\(subdeviceId, map\.names, map\.positions\)/, "subdevice LEDs must use SignalRGB's three-argument API");
 

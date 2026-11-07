@@ -1,0 +1,9 @@
+// Placeholder for SignalRGB 2.5.86 device contexts.
+//
+// When SignalRGB loads OpenRGBBridge.js for an OpenRGB device, it cannot resolve the
+// built-in "@SignalRGB/tcp" module and instead looks for this file inside the addon
+// folder. Without it, the whole device script fails to load. Devices never use TCP
+// (the discovery service sends every frame to OpenRGB), so an empty export is enough.
+const tcp = undefined;
+export { tcp };
+export default tcp;

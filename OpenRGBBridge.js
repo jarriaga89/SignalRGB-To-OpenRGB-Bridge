@@ -1,44 +1,10 @@
-// SignalRGB 2.5.86 cannot resolve "@SignalRGB/tcp" when it loads this file for an
-// addon-created device, and a failed static import stops the entire script (the
-// device then shows as a nameless "Thirdparty Plugin" and SignalRGB retries the load
-// several times a second). Load the module at runtime, and only in the discovery
-// service; devices hand their colours to the service instead of opening sockets.
-let tcp = undefined;
-let tcpLoadState = "idle";
-
-function loadTcpModule(logger) {
-	const log = logger || logFromService;
-	if (tcp || tcpLoadState === "loading" || tcpLoadState === "failed") {
-		return;
-	}
-	if (typeof globalThis !== "undefined" && globalThis.tcp && typeof globalThis.tcp.createSocket === "function") {
-		tcp = globalThis.tcp;
-		tcpLoadState = "ready";
-		return;
-	}
-	tcpLoadState = "loading";
-	try {
-		// Built through Function so engines without dynamic import() still parse this file.
-		const dynamicImport = new Function("specifier", "return import(specifier);");
-		dynamicImport("@SignalRGB/tcp").then(function (mod) {
-			const candidate = mod && (mod.tcp || (mod.default && (mod.default.tcp || mod.default)) || mod);
-			if (candidate && typeof candidate.createSocket === "function") {
-				tcp = candidate;
-				tcpLoadState = "ready";
-				log("[DIAG] TCP module loaded at runtime.");
-			} else {
-				tcpLoadState = "failed";
-				log("[DIAG] TCP module loaded without createSocket; exports: " + Object.keys(mod || {}).join(","));
-			}
-		}, function (error) {
-			tcpLoadState = "failed";
-			log("[DIAG] TCP module import failed: " + error);
-		});
-	} catch (error) {
-		tcpLoadState = "failed";
-		log("[DIAG] TCP module runtime import unsupported: " + error);
-	}
-}
+// The discovery service needs SignalRGB's TCP module, and SignalRGB's engine only
+// supports static imports (runtime import() is a parse error on 2.5.86).
+// Device contexts on 2.5.86 cannot resolve "@SignalRGB/tcp" and fall back to a file
+// lookup inside the addon folder, so a placeholder module ships at
+// "@SignalRGB/tcp" (see that folder). Devices never use TCP: they hand their frames
+// to the discovery service, which owns every OpenRGB connection.
+import tcp from "@SignalRGB/tcp";
 
 export function Name() { return "OpenRGB Bridge"; }
 export function Version() { return "2.0.2"; }
@@ -253,7 +219,6 @@ export function DiscoveryService() {
 	this.lastForwardLogAt = 0;
 
 	this.Initialize = function () {
-		loadTcpModule(logFromService);
 		this.connectSelectedDevices();
 		// A discovery service with no registered controller is not guaranteed to receive
 		// Update() ticks in SignalRGB 2.5.76. Start the initial SDK discovery here so a
@@ -347,14 +312,7 @@ export function DiscoveryService() {
 	this.refresh = function (host, port) {
 		host = normalizeHost(host);
 		port = normalizePort(port);
-		loadTcpModule(logFromService);
-		if (!tcp && tcpLoadState === "loading") {
-			// Update() retries the scan once the runtime import finishes.
-			this.needsScan = true;
-			this.busy = false;
-			this.setStatus("Loading SignalRGB TCP module...");
-			return this.status;
-		}
+
 		const refreshId = ++this.refreshId;
 		this.busy = true;
 		this.lastAutoAttemptAt = Date.now();
@@ -917,14 +875,6 @@ class OpenRGBClient {
 		}
 		if (Date.now() < this.nextConnectAt) {
 			return;
-		}
-
-		if (!tcp) {
-			loadTcpModule(this.logger);
-			if (tcpLoadState === "loading") {
-				this.nextConnectAt = Date.now() + 250;
-				return;
-			}
 		}
 
 		if (!tcp || typeof tcp.createSocket !== "function") {
