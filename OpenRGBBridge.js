@@ -21,6 +21,9 @@ const HOST_SETTING = "SDKServerIP";
 const PORT_SETTING = "SDKServerPort";
 const SELECTED_DEVICES_SETTING = "SelectedDevices";
 const LAST_DEVICES_SETTING = "LastDevices";
+// IDs the user explicitly deleted. Anything found by a scan and not listed here is active,
+// so a stale empty selection (e.g. from a scan that found nothing) can no longer hide new devices.
+const EXCLUDED_DEVICES_SETTING = "ExcludedDevices";
 const UI_STATE_SETTING = "UiState";
 const DEFAULT_HOST = "127.0.0.1";
 const DEFAULT_PORT = 6742;
@@ -141,8 +144,8 @@ export function DiscoveryService() {
 	this.availableDeviceSummaries = readLastDeviceSummaries();
 	this.selectedDevices = readSelectedDevices();
 	this.hasStoredSelectedDevices = hasStoredSelectedDevices();
-	if (!this.hasStoredSelectedDevices && this.availableDeviceSummaries.length > 0) {
-		this.selectedDevices = this.availableDeviceSummaries.slice(0);
+	if (this.availableDeviceSummaries.length > 0 && (!this.hasStoredSelectedDevices || this.selectedDevices.length === 0)) {
+		this.selectedDevices = filterExcluded(this.availableDeviceSummaries);
 	}
 	this.status = buildLookingForStatus();
 	this.client = undefined;
@@ -240,11 +243,8 @@ export function DiscoveryService() {
 					self.availableDeviceSummaries = buildDeviceSummaries(self.availableDevices);
 					self.queueStaleControllers(knownBeforeRefresh, self.availableDevices);
 					saveSetting(LAST_DEVICES_SETTING, JSON.stringify(self.availableDeviceSummaries));
-					const selectedBeforeRefresh = self.selectedDevices.length > 0 ? self.selectedDevices : readSelectedDevices();
-					self.hasStoredSelectedDevices = self.hasStoredSelectedDevices || hasStoredSelectedDevices();
-					self.selectedDevices = self.hasStoredSelectedDevices
-						? getSelectedDevicesById(self.availableDevices, selectedBeforeRefresh)
-						: self.availableDeviceSummaries.slice(0);
+					self.selectedDevices = getSelectedDevicesById(self.availableDevices, filterExcluded(self.availableDeviceSummaries));
+					logFromService("[DIAG] selection after scan: " + self.selectedDevices.length + " active, excluded=" + JSON.stringify(readExcludedIds()));
 					saveSetting(SELECTED_DEVICES_SETTING, JSON.stringify(self.selectedDevices));
 					self.hasStoredSelectedDevices = true;
 					self.requestControllerSync();
@@ -377,6 +377,7 @@ export function DiscoveryService() {
 		this.selectedDevices = this.selectedDevices.filter(function (item) {
 			return item.deviceId !== deviceId;
 		});
+		addExcludedIds([deviceId]);
 		this.saveSelection();
 		this.requestControllerSync();
 		this.setStatus("Deleted device.");
@@ -388,6 +389,7 @@ export function DiscoveryService() {
 		for (let i = 0; i < previouslySelected.length; i++) {
 			this.rememberAvailable(previouslySelected[i]);
 		}
+		addExcludedIds(getDeviceIds(this.getAllKnownDevices()));
 		this.selectedDevices = [];
 		this.saveSelection();
 		this.requestControllerSync();
@@ -403,6 +405,7 @@ export function DiscoveryService() {
 			return this.status;
 		}
 
+		removeExcludedIds([deviceId]);
 		this.selectedDevices = getSelectedDevicesById(this.availableDevices, this.selectedDevices.concat([deviceData]));
 		this.saveSelection();
 		this.requestControllerSync();
@@ -411,6 +414,7 @@ export function DiscoveryService() {
 	};
 
 	this.restoreAllDevices = function () {
+		saveSetting(EXCLUDED_DEVICES_SETTING, "[]");
 		this.selectedDevices = this.getAllKnownDevices().slice(0);
 		this.saveSelection();
 		this.requestControllerSync();
@@ -2041,6 +2045,35 @@ function safeJsonParse(value, fallback) {
 	} catch (_) {
 		return fallback;
 	}
+}
+
+function readExcludedIds() {
+	const ids = safeJsonParse(readSetting(EXCLUDED_DEVICES_SETTING, "[]"), []);
+	return Array.isArray(ids) ? ids.map(String) : [];
+}
+
+function addExcludedIds(ids) {
+	const current = readExcludedIds();
+	for (let i = 0; i < ids.length; i++) {
+		if (ids[i] && current.indexOf(String(ids[i])) < 0) {
+			current.push(String(ids[i]));
+		}
+	}
+	saveSetting(EXCLUDED_DEVICES_SETTING, JSON.stringify(current));
+}
+
+function removeExcludedIds(ids) {
+	const drop = (ids || []).map(String);
+	saveSetting(EXCLUDED_DEVICES_SETTING, JSON.stringify(readExcludedIds().filter(function (id) {
+		return drop.indexOf(id) < 0;
+	})));
+}
+
+function filterExcluded(devices) {
+	const excluded = readExcludedIds();
+	return (devices || []).filter(function (item) {
+		return item && item.deviceId && excluded.indexOf(String(item.deviceId)) < 0;
+	});
 }
 
 function readSelectedDevices() {
