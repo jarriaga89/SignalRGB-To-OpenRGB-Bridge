@@ -7,6 +7,18 @@ Item {
     property int activeCount: 0
     property int deletedCount: 0
     property int lastUiRevision: 0
+    // Some SignalRGB builds (2.5.86) give this page no route to the service state.
+    // After a few empty polls, poll every 5 s instead of every 500 ms.
+    property int emptyPolls: 0
+
+    function notePoll(gotState) {
+        if (gotState) {
+            emptyPolls = 0
+            uiPollTimer.interval = 500
+        } else if (++emptyPolls >= 6) {
+            uiPollTimer.interval = 5000
+        }
+    }
     property string deviceCatalogJson: ""
     property int pollRevision: 0
 
@@ -118,21 +130,16 @@ Item {
             }
             var rawState = service.getSetting("General", "UiState")
             var persistedState = toStateObject(rawState)
-            if (pollRevision % 10 === 1) {
-                logUi("[DIAG-UI] poll " + pollRevision + ": UiState type=" + (typeof rawState) + " rev=" + Number(persistedState.revision || 0) + " devicesJsonLen=" + String(persistedState.devicesJson || "").length + " active=" + activeCount + " deleted=" + deletedCount)
-            }
             if (Number(persistedState.revision || 0) > 0) {
                 if (String(persistedState.status || "") !== "") {
                     statusText = String(persistedState.status)
                 }
                 updateDeviceModels(persistedState.devicesJson)
                 busy = !!persistedState.busy
+                notePoll(true)
                 return
             }
         } catch (e) {
-            if (pollRevision === 1) {
-                logUi("[DIAG-UI] UiState route skipped: " + String(e))
-            }
         }
 
         try {
@@ -140,9 +147,6 @@ Item {
             var liveState = toStateObject(rawLive)
             var liveRevision = Number(liveState.revision || 0)
             var tokenOk = String(liveState.pollToken || "") === String(pollRevision)
-            if (pollRevision % 10 === 1) {
-                logUi("[DIAG-UI] live route: type=" + (typeof rawLive) + " tokenOk=" + tokenOk + " rev=" + liveRevision + " lastRev=" + lastUiRevision + " devicesType=" + (typeof liveState.devicesJson))
-            }
             if (tokenOk || liveRevision > lastUiRevision) {
                 lastUiRevision = Math.max(lastUiRevision, liveRevision)
                 if (String(liveState.status || "") !== "") {
@@ -150,12 +154,10 @@ Item {
                 }
                 updateDeviceModels(liveState.devicesJson)
                 busy = !!liveState.busy
+                notePoll(true)
                 return
             }
         } catch (e) {
-            if (pollRevision % 10 === 1) {
-                logUi("[DIAG-UI] live route failed: " + String(e))
-            }
         }
 
         var foundStatus = ""
@@ -180,6 +182,7 @@ Item {
             }
         } catch (e) {
             busy = readBusy()
+            notePoll(false)
             return
         }
         if (foundStatus !== "") {
@@ -189,6 +192,7 @@ Item {
             updateDeviceModels(foundDeviceCatalog)
         }
         busy = haveStatusBus ? statusBusBusy : readBusy()
+        notePoll(haveStatusBus)
     }
 
     function readBusy() {
@@ -237,6 +241,7 @@ Item {
     }
 
     Timer {
+        id: uiPollTimer
         interval: 500
         running: true
         repeat: true

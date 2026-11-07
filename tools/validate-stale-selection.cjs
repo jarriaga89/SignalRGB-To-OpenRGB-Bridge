@@ -228,6 +228,9 @@ context.XMLHttpRequest = function () {
 		xhr.onreadystatechange();
 	};
 };
+let fakeNow = Date.now();
+context.Date = { now: () => fakeNow };
+const step = (ms) => { fakeNow += ms; };
 context.controller = gpuController;
 Object.assign(context, { LightingMode: "Canvas", forcedColor: "#009bde", shutdownColor: "#009bde" });
 context.device.log = (m) => { if (String(m).includes("OpenRGB Bridge:")) console.log("  device:", String(m)); };
@@ -237,22 +240,36 @@ assert.equal(requests.length, 1, "a changed frame must be sent to the helper");
 assert.equal(requests[0], "http://localhost:6748/frame?h=127.0.0.1&p=6742&i=0&c=ff00000000ff",
 	"the request must carry OpenRGB host, port, controller index and both zone colours");
 
+step(40);
 context.__bridgeTest.Render();
 assert.equal(requests.length, 1, "an unchanged frame must not be resent");
 
 // helper down: one log, backoff, newest colours resent after recovery
 context.device.subdeviceColor = (id) => (id.endsWith("Logo") ? [0, 255, 0] : [0, 0, 255]);
 respond = 0;
+step(40);
 context.__bridgeTest.Render();
 assert.equal(requests.length, 2, "the new frame is attempted once");
+step(40);
 context.__bridgeTest.Render();
 assert.equal(requests.length, 2, "no retry before the backoff expires");
 respond = 200;
-const realNow = Date.now;
-context.Date = { now: () => realNow() + 5000 };
+step(5000);
 context.__bridgeTest.Render();
-context.Date = Date;
 assert.equal(requests.length, 3, "the pending frame is retried after the backoff");
 assert.match(requests[2], /c=00ff000000ff$/, "the retry carries the newest colours");
+
+// rate cap: a burst of changing frames within one 33 ms window sends at most one request
+const burstStart = requests.length;
+for (let i = 0; i < 10; i++) {
+	context.device.subdeviceColor = (id) => [i * 20, 0, id.endsWith("Logo") ? 1 : 2];
+	step(3);
+	context.__bridgeTest.Render();
+}
+assert.ok(requests.length - burstStart <= 1, "changing frames are capped at ~30 per second");
+step(40);
+context.__bridgeTest.Render();
+assert.match(requests[requests.length - 1], /c=b4000100+b40002$|c=b40001b40002$/, "after the window the newest colours go out");
+context.Date = Date;
 
 console.log("Stale-selection validation passed.");

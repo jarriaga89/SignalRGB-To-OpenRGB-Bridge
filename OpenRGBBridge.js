@@ -95,22 +95,15 @@ export function Initialize() {
 	deviceSetupFailed = false;
 	renderErrorLogged = false;
 	try {
-		logFromDevice("[DIAG-DEV] controller: type=" + (typeof controller) +
-			" name=" + (typeof controller.name) + ":" + String(controller.name).slice(0, 60) +
-			" deviceId=" + (typeof controller.deviceId) +
-			" zones=" + (Array.isArray(controller.zones) ? controller.zones.length : typeof controller.zones) +
-			" leds=" + (Array.isArray(controller.leds) ? controller.leds.length : typeof controller.leds) +
-			" host=" + (typeof controller.openrgbHost) + " index=" + (typeof controller.openrgbIndex));
 
 		device.setName(typeof controller.name === "string" && controller.name ? controller.name : "OpenRGB Device");
 		device.setImageFromUrl(typeof controller.image === "string" && controller.image ? controller.image : ICON_URL);
 
 		const stateKey = getRenderStateKey(controller);
 		renderStates[stateKey] = buildSignalRgbLayout(controller);
-		logFromDevice("[DIAG-DEV] Initialize finished");
 	} catch (error) {
 		deviceSetupFailed = true;
-		logFromDevice("[DIAG-DEV] Initialize FAILED: " + error + (error && error.stack ? " | " + error.stack : ""));
+		logFromDevice("OpenRGB Bridge: device setup failed: " + error);
 	}
 }
 
@@ -125,7 +118,7 @@ export function Render() {
 	} catch (error) {
 		if (!renderErrorLogged) {
 			renderErrorLogged = true;
-			logFromDevice("[DIAG-DEV] Render FAILED (further errors suppressed): " + error + (error && error.stack ? " | " + error.stack : ""));
+			logFromDevice("OpenRGB Bridge: render failed (further errors suppressed): " + error);
 		}
 		device.pause(1000);
 	}
@@ -136,6 +129,10 @@ export function Render() {
 // OpenRGB Bridge Helper (helper/OpenRGBBridgeHelper.ps1), which forwards them to OpenRGB.
 const HELPER_URL = "http://localhost:6748";
 const HELPER_RETRY_MS = 2000;
+// OpenRGB throttles NVIDIA illumination calls itself, so more than ~30 updates a second
+// only adds work for SignalRGB, the helper and OpenRGB without visible benefit.
+const HELPER_MIN_INTERVAL_MS = 33;
+let helperLastSendAt = 0;
 let helperBusy = false;
 let helperPending = null;
 let helperRetryAt = 0;
@@ -158,7 +155,7 @@ function renderFrame() {
 	}
 
 	pumpHelper();
-	device.pause(16);
+	device.pause(HELPER_MIN_INTERVAL_MS);
 }
 
 function queueHelperFrame(frame) {
@@ -180,7 +177,8 @@ function helperFrameUrl(frame) {
 }
 
 function pumpHelper() {
-	if (helperBusy || !helperPending || Date.now() < helperRetryAt) {
+	const now = Date.now();
+	if (helperBusy || !helperPending || now < helperRetryAt || now - helperLastSendAt < HELPER_MIN_INTERVAL_MS) {
 		return;
 	}
 	if (typeof XMLHttpRequest === "undefined") {
@@ -200,6 +198,7 @@ function pumpHelper() {
 	}
 
 	helperBusy = true;
+	helperLastSendAt = now;
 	const xhr = new XMLHttpRequest();
 	xhr.onreadystatechange = function () {
 		if (xhr.readyState !== 4) {
@@ -250,9 +249,10 @@ export function Shutdown() {
 		}
 		helperBusy = false;
 		helperRetryAt = 0;
+		helperLastSendAt = 0;
 		pumpHelper();
 	} catch (error) {
-		logFromDevice("[DIAG-DEV] Shutdown colour not published: " + error);
+		logFromDevice("OpenRGB Bridge: shutdown colour not sent: " + error);
 	}
 }
 
@@ -363,7 +363,6 @@ export function DiscoveryService() {
 					self.queueStaleControllers(knownBeforeRefresh, self.availableDevices);
 					saveSetting(LAST_DEVICES_SETTING, JSON.stringify(self.availableDeviceSummaries));
 					self.selectedDevices = getSelectedDevicesById(self.availableDevices, filterExcluded(self.availableDeviceSummaries));
-					logFromService("[DIAG] selection after scan: " + self.selectedDevices.length + " active, excluded=" + JSON.stringify(readExcludedIds()));
 					saveSetting(SELECTED_DEVICES_SETTING, JSON.stringify(self.selectedDevices));
 					self.hasStoredSelectedDevices = true;
 					self.requestControllerSync();
@@ -649,11 +648,9 @@ export function DiscoveryService() {
 		this.controllersDirty = false;
 		this.syncingControllers = true;
 		try {
-			logFromService("[DIAG] syncControllers starting");
 			this.syncControllers();
-			logFromService("[DIAG] syncControllers finished; service.controllers=" + ((service.controllers || []).length));
 		} catch (error) {
-			logFromService("[DIAG] syncControllers FAILED: " + error + (error && error.stack ? " | " + error.stack : ""));
+			logFromService("OpenRGB Bridge: device sync failed: " + error);
 		} finally {
 			this.syncingControllers = false;
 		}
@@ -722,7 +719,6 @@ export function DiscoveryService() {
 		const deviceId = deviceData.deviceId;
 		let controller = service.getController(deviceId);
 
-		logFromService("[DIAG] applyController " + deviceId + " active=" + active + " existing=" + (controller !== undefined));
 		if (!active) {
 			deviceData.bridgeDeleted = true;
 			closeRenderState(deviceId);
@@ -757,12 +753,9 @@ export function DiscoveryService() {
 			service.removeController(controller);
 		}
 
-		logFromService("[DIAG] applyController new: " + deviceId + " name=" + deviceData.name + " leds=" + getControllerLedCount(deviceData) + " zones=" + (deviceData.zones ? deviceData.zones.length : 0) + " type=" + deviceData.type);
 		controller = new OpenRGBController(deviceData);
 		service.addController(controller);
-		logFromService("[DIAG] addController ok");
 		service.announceController(controller);
-		logFromService("[DIAG] announceController ok");
 
 		return deviceId;
 	};
