@@ -175,6 +175,10 @@ Item {
                     foundStatus = typeof obj.bridgeStatus === "string" ? obj.bridgeStatus : ""
                     foundDeviceCatalog = obj.bridgeDevicesJson
                     statusBusBusy = obj.bridgeBusy === true
+                    break
+                }
+                if (pollRevision % 10 === 1 && i === 0) {
+                    logUi("[DIAG-UI] controller route: id=" + String(obj.id) + " busType=" + (typeof obj.bridgeStatusBus) + " devicesType=" + (typeof obj.bridgeDevicesJson))
                 }
             }
         } catch (e) {

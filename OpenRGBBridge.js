@@ -534,6 +534,7 @@ export function DiscoveryService() {
 		try {
 			logFromService("[DIAG] syncControllers starting");
 			this.syncControllers();
+			this.publishUiStateToControllers();
 			logFromService("[DIAG] syncControllers finished; service.controllers=" + ((service.controllers || []).length));
 		} catch (error) {
 			logFromService("[DIAG] syncControllers FAILED: " + error + (error && error.stack ? " | " + error.stack : ""));
@@ -657,8 +658,30 @@ export function DiscoveryService() {
 		return this.status;
 	};
 
+	// SignalRGB 2.5.77+ does not pass discovery-method return values or settings to QML,
+	// but QML can read properties of registered controllers. Mirror the UI state there.
+	this.publishUiStateToControllers = function () {
+		const entries = service.controllers || [];
+		for (let i = 0; i < entries.length; i++) {
+			const obj = entries[i] && entries[i].obj;
+			if (!obj || typeof obj !== "object") {
+				continue;
+			}
+			obj.bridgeStatusBus = true;
+			obj.bridgeStatus = String(this.status || buildLookingForStatus());
+			obj.bridgeBusy = !!this.busy;
+			obj.bridgeDevicesJson = String(this.deviceCatalogJson || "[]");
+			obj.bridgeUiRevision = this.uiStateRevision;
+		}
+	};
+
 	this.persistUiState = function () {
 		this.uiStateRevision++;
+		try {
+			this.publishUiStateToControllers();
+		} catch (error) {
+			logFromService("[DIAG] publishUiStateToControllers failed: " + error);
+		}
 		logFromService("[DIAG] persistUiState rev=" + this.uiStateRevision + " catalogLen=" + String(this.deviceCatalogJson || "[]").length);
 		saveSetting(UI_STATE_SETTING, JSON.stringify({
 			revision: this.uiStateRevision,
