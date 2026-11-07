@@ -34,13 +34,21 @@ if ($localCopy -and (Test-Path $localCopy)) {
 }
 Unblock-File -Path $Target -ErrorAction SilentlyContinue
 
-$action = New-ScheduledTaskAction -Execute 'powershell.exe' `
-	-Argument "-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$Target`""
+# powershell.exe -WindowStyle Hidden still shows a console when started by Task
+# Scheduler, and closing that window stops the helper. A Windows Script Host launcher
+# starts it with no window at all.
+$Launcher = Join-Path $InstallDir 'start-helper.vbs'
+$psCommand = "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File ""$Target"""
+Set-Content -Path $Launcher -Encoding ASCII -Value @(
+	'Set shell = CreateObject("WScript.Shell")',
+	('shell.Run "' + $psCommand.Replace('"', '""') + '", 0, False')
+)
+$action = New-ScheduledTaskAction -Execute 'wscript.exe' -Argument "`"$Launcher`""
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User "$env:USERDOMAIN\$env:USERNAME"
 $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
 	-ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -MultipleInstances IgnoreNew
 $StartupLink = Join-Path ([Environment]::GetFolderPath('Startup')) 'OpenRGB Bridge Helper.lnk'
-$arguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$Target`""
+$arguments = "`"$Launcher`""
 $useTask = $true
 try {
 	Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Settings $settings `
@@ -52,9 +60,8 @@ try {
 	$useTask = $false
 	$shell = New-Object -ComObject WScript.Shell
 	$link = $shell.CreateShortcut($StartupLink)
-	$link.TargetPath = 'powershell.exe'
+	$link.TargetPath = 'wscript.exe'
 	$link.Arguments = $arguments
-	$link.WindowStyle = 7
 	$link.Description = 'OpenRGB Bridge Helper'
 	$link.Save()
 	Write-Host "Logon task refused ($($_.Exception.Message)); added a Startup-folder shortcut instead"
@@ -63,7 +70,7 @@ try {
 if ($useTask) {
 	Start-ScheduledTask -TaskName $TaskName
 } else {
-	Start-Process -FilePath 'powershell.exe' -ArgumentList $arguments -WindowStyle Hidden
+	Start-Process -FilePath 'wscript.exe' -ArgumentList $arguments
 }
 $ok = $false
 for ($i = 0; $i -lt 20 -and -not $ok; $i++) {
