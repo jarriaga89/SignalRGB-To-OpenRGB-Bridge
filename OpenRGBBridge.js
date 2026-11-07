@@ -96,7 +96,9 @@ export function Initialize() {
 	renderErrorLogged = false;
 	try {
 		try {
-			logFromDevice("[DIAG-DEV] context: " + describeContext());
+			logFromDevice("[DIAG-DEV] scope: " + describeScope());
+			logFromDevice("[DIAG-DEV] device.Settings: " + describeObject(device.Settings));
+			logFromDevice("[DIAG-DEV] settings write: " + tryDeviceSettingWrite("device-" + Date.now()));
 		} catch (error) {
 			logFromDevice("[DIAG-DEV] context probe failed: " + error);
 		}
@@ -226,7 +228,8 @@ export function DiscoveryService() {
 
 	this.Initialize = function () {
 		try {
-			logFromService("[DIAG] service context: " + describeContext());
+			logFromService("[DIAG] service scope: " + describeScope());
+			logFromService("[DIAG] service object: " + describeObject(service));
 		} catch (error) {
 			logFromService("[DIAG] service context probe failed: " + error);
 		}
@@ -299,6 +302,14 @@ export function DiscoveryService() {
 			}
 
 			if (logView) {
+				let probe;
+				try {
+					probe = String(readSetting(PROBE_SETTING, "<none>"));
+				} catch (error) {
+					probe = "read failed: " + error;
+				}
+				logFromService("[DIAG] settings probe seen by service: " + probe.slice(0, 80) +
+					" | userProperty on controller: " + (typeof obj.bridgeProbe) + ":" + String(obj.bridgeProbe).slice(0, 40));
 				logFromService("[DIAG] pump view " + entryId + ": seq=" + (typeof seq) + ":" + seq +
 					" json=" + (typeof obj.bridgeFrameJson) + ":" + String(obj.bridgeFrameJson || "").length +
 					" sameObj=" + (looked === entryObj) + " forwarded=" + this.forwardedFrames);
@@ -2288,6 +2299,69 @@ function clampByte(value) {
 }
 
 // Reports which communication primitives exist in the current SignalRGB context.
+function describeScope() {
+	const kinds = [];
+	const add = function (name, fn) {
+		let kind;
+		try {
+			kind = fn();
+		} catch (error) {
+			kind = "throws";
+		}
+		kinds.push(name + "=" + kind);
+	};
+	add("tcp", function () { return typeof tcp + (tcp ? "(" + typeof tcp.createSocket + ")" : ""); });
+	add("XMLHttpRequest", function () { return typeof XMLHttpRequest; });
+	add("WebSocket", function () { return typeof WebSocket; });
+	add("fetch", function () { return typeof fetch; });
+	add("udp", function () { return typeof udp; });
+	add("service", function () { return typeof service; });
+	add("Promise", function () { return typeof Promise; });
+	add("setTimeout", function () { return typeof setTimeout; });
+	return kinds.join(" ");
+}
+
+function describeObject(value) {
+	if (value === undefined || value === null) {
+		return String(value);
+	}
+	let keys = [];
+	try {
+		const proto = Object.getPrototypeOf(value);
+		keys = Object.getOwnPropertyNames(value).concat(proto ? Object.getOwnPropertyNames(proto) : []);
+	} catch (error) {
+		return typeof value + " (keys unavailable: " + error + ")";
+	}
+	return typeof value + " {" + keys.filter(function (k) {
+		return !/^(constructor|toString|toLocaleString|valueOf|hasOwnProperty|isPrototypeOf|propertyIsEnumerable|__.*)$/.test(k);
+	}).slice(0, 50).join(",") + "}";
+}
+
+// Settings round trip: the device writes a marker, the service reads it back.
+const PROBE_SETTING = "DeviceProbe";
+
+function tryDeviceSettingWrite(value) {
+	const results = [];
+	const settings = device.Settings;
+	const attempts = [
+		["Settings.setValue", function () { settings.setValue(SETTINGS_GROUP + "/" + PROBE_SETTING, value); }],
+		["Settings.saveSetting", function () { settings.saveSetting(SETTINGS_GROUP, PROBE_SETTING, value); }],
+		["Settings.set", function () { settings.set(PROBE_SETTING, value); }],
+		["device.saveSetting", function () { device.saveSetting(SETTINGS_GROUP, PROBE_SETTING, value); }],
+		["device.addProperty", function () { device.addProperty({ property: "bridgeProbe", type: "textfield", default: value, label: "bridgeProbe" }); }],
+		["device.setUserProperty", function () { device.setUserProperty("bridgeProbe", value); }]
+	];
+	for (let i = 0; i < attempts.length; i++) {
+		try {
+			attempts[i][1]();
+			results.push(attempts[i][0] + "=ok");
+		} catch (error) {
+			results.push(attempts[i][0] + "=" + String(error).slice(0, 60));
+		}
+	}
+	return results.join(" ");
+}
+
 function describeContext() {
 	const g = (typeof globalThis !== "undefined") ? globalThis : {};
 	const names = ["tcp", "udp", "XMLHttpRequest", "WebSocket", "fetch", "service", "device", "controller",
