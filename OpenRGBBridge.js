@@ -1,4 +1,44 @@
-import tcp from "@SignalRGB/tcp";
+// SignalRGB 2.5.86 cannot resolve "@SignalRGB/tcp" when it loads this file for an
+// addon-created device, and a failed static import stops the entire script (the
+// device then shows as a nameless "Thirdparty Plugin" and SignalRGB retries the load
+// several times a second). Load the module at runtime, and only in the discovery
+// service; devices hand their colours to the service instead of opening sockets.
+let tcp = undefined;
+let tcpLoadState = "idle";
+
+function loadTcpModule(logger) {
+	const log = logger || logFromService;
+	if (tcp || tcpLoadState === "loading" || tcpLoadState === "failed") {
+		return;
+	}
+	if (typeof globalThis !== "undefined" && globalThis.tcp && typeof globalThis.tcp.createSocket === "function") {
+		tcp = globalThis.tcp;
+		tcpLoadState = "ready";
+		return;
+	}
+	tcpLoadState = "loading";
+	try {
+		// Built through Function so engines without dynamic import() still parse this file.
+		const dynamicImport = new Function("specifier", "return import(specifier);");
+		dynamicImport("@SignalRGB/tcp").then(function (mod) {
+			const candidate = mod && (mod.tcp || (mod.default && (mod.default.tcp || mod.default)) || mod);
+			if (candidate && typeof candidate.createSocket === "function") {
+				tcp = candidate;
+				tcpLoadState = "ready";
+				log("[DIAG] TCP module loaded at runtime.");
+			} else {
+				tcpLoadState = "failed";
+				log("[DIAG] TCP module loaded without createSocket; exports: " + Object.keys(mod || {}).join(","));
+			}
+		}, function (error) {
+			tcpLoadState = "failed";
+			log("[DIAG] TCP module import failed: " + error);
+		});
+	} catch (error) {
+		tcpLoadState = "failed";
+		log("[DIAG] TCP module runtime import unsupported: " + error);
+	}
+}
 
 export function Name() { return "OpenRGB Bridge"; }
 export function Version() { return "2.0.2"; }
@@ -101,7 +141,6 @@ export function Initialize() {
 
 		const stateKey = getRenderStateKey(controller);
 		renderStates[stateKey] = buildSignalRgbLayout(controller);
-		ensureRenderClient(controller, logFromDevice);
 		logFromDevice("[DIAG-DEV] Initialize finished");
 	} catch (error) {
 		deviceSetupFailed = true;
@@ -126,51 +165,55 @@ export function Render() {
 	}
 }
 
+let framePublishLogged = false;
+
 function renderFrame() {
-	const client = ensureRenderClient(controller, logFromDevice);
-	if (!client) {
-		return;
-	}
-
-	client.ensureConnected();
-
 	const stateKey = getRenderStateKey(controller);
 	const state = renderStates[stateKey] || buildSignalRgbLayout(controller);
 	renderStates[stateKey] = state;
 
-	if (client.isReady()) {
-		setCustomModesForState(client, state);
-	}
-
 	const frames = collectFrameColors(state);
+	let changed = false;
 	for (let i = 0; i < frames.length; i++) {
-		const frame = frames[i];
-		const signature = makeFrameSignature(frame.colors);
-		const signatureKey = String(frame.openrgbIndex);
-
+		const signature = makeFrameSignature(frames[i].colors);
+		const signatureKey = String(frames[i].openrgbIndex);
 		if (signature !== state.lastFrameSignatures[signatureKey]) {
-			client.updateLeds(frame.openrgbIndex, frame.colors);
 			state.lastFrameSignatures[signatureKey] = signature;
+			changed = true;
 		}
 	}
 
+	if (changed) {
+		publishFrames(frames);
+	}
+
 	device.pause(16);
+}
+
+function publishFrames(frames) {
+	controller.bridgeFrames = frames.map(function (frame) {
+		return { openrgbIndex: frame.openrgbIndex, colors: frame.colors };
+	});
+	controller.bridgeFrameSeq = (typeof controller.bridgeFrameSeq === "number" ? controller.bridgeFrameSeq : 0) + 1;
+	if (!framePublishLogged) {
+		framePublishLogged = true;
+		logFromDevice("[DIAG-DEV] publishing frames to the bridge service; seq readback=" + (typeof controller.bridgeFrameSeq) + ":" + controller.bridgeFrameSeq);
+	}
 }
 
 export function Shutdown() {
 	const stateKey = getRenderStateKey(controller);
 	delete renderStates[stateKey];
 
-	if (!renderClient) {
-		return;
+	try {
+		const rgb = hexToRgb(shutdownColor);
+		const devices = controller.devices || [controller];
+		publishFrames(devices.map(function (item) {
+			return { openrgbIndex: item.openrgbIndex, colors: fillColors(getControllerLedCount(item), rgb) };
+		}));
+	} catch (error) {
+		logFromDevice("[DIAG-DEV] Shutdown colour not published: " + error);
 	}
-
-	const rgb = hexToRgb(shutdownColor);
-	const devices = controller.devices || [controller];
-	for (let i = 0; i < devices.length; i++) {
-		renderClient.updateLeds(devices[i].openrgbIndex, fillColors(getControllerLedCount(devices[i]), rgb));
-	}
-	closeRenderClientIfIdle();
 }
 
 export function DiscoveryService() {
@@ -203,7 +246,14 @@ export function DiscoveryService() {
 	this.needsScan = true;
 	this.lastAutoAttemptAt = 0;
 
+	this.lastFrameSeq = {};
+	this.customModeSent = {};
+	this.customModeClient = undefined;
+	this.forwardedFrames = 0;
+	this.lastForwardLogAt = 0;
+
 	this.Initialize = function () {
+		loadTcpModule(logFromService);
 		this.connectSelectedDevices();
 		// A discovery service with no registered controller is not guaranteed to receive
 		// Update() ticks in SignalRGB 2.5.76. Start the initial SDK discovery here so a
@@ -215,6 +265,14 @@ export function DiscoveryService() {
 
 	this.Update = function () {
 		this.flushControllerSync();
+		try {
+			this.pumpDeviceFrames();
+		} catch (error) {
+			if (!this.pumpErrorLogged) {
+				this.pumpErrorLogged = true;
+				logFromService("[DIAG] frame forwarding failed: " + error);
+			}
+		}
 		if (this.client) {
 			this.client.checkRequestTimeouts();
 			return;
@@ -235,9 +293,68 @@ export function DiscoveryService() {
 		this.refresh(host, port);
 	};
 
+	// Devices cannot open sockets on SignalRGB 2.5.86, so each device publishes its latest
+	// colours on its controller and the service sends them to OpenRGB.
+	this.pumpDeviceFrames = function () {
+		const entries = service.controllers || [];
+		for (let i = 0; i < entries.length; i++) {
+			const obj = entries[i] && entries[i].obj;
+			if (!obj || typeof obj !== "object" || typeof obj.bridgeFrameSeq !== "number") {
+				continue;
+			}
+			const id = String(obj.deviceId || obj.id || i);
+			if (this.lastFrameSeq[id] === obj.bridgeFrameSeq) {
+				continue;
+			}
+
+			const client = ensureRenderClient(obj, logFromService);
+			if (!client) {
+				continue;
+			}
+			client.ensureConnected();
+			if (!client.isReady()) {
+				continue;
+			}
+			if (this.customModeClient !== client) {
+				this.customModeClient = client;
+				this.customModeSent = {};
+			}
+
+			const frames = obj.bridgeFrames || [];
+			for (let f = 0; f < frames.length; f++) {
+				const frame = frames[f];
+				const key = String(frame.openrgbIndex);
+				if (!this.customModeSent[key]) {
+					client.setCustomMode(frame.openrgbIndex);
+					this.customModeSent[key] = true;
+				}
+				client.updateLeds(frame.openrgbIndex, frame.colors);
+			}
+			if (this.forwardedFrames === 0) {
+				logFromService("[DIAG] first frame forwarded to OpenRGB for " + (obj.name || id) + " (" + frames.length + " zone frame(s)).");
+			}
+			this.lastFrameSeq[id] = obj.bridgeFrameSeq;
+			this.forwardedFrames++;
+		}
+
+		const now = Date.now();
+		if (this.forwardedFrames > 0 && now - this.lastForwardLogAt > 30000) {
+			this.lastForwardLogAt = now;
+			logFromService("[DIAG] frames forwarded so far: " + this.forwardedFrames);
+		}
+	};
+
 	this.refresh = function (host, port) {
 		host = normalizeHost(host);
 		port = normalizePort(port);
+		loadTcpModule(logFromService);
+		if (!tcp && tcpLoadState === "loading") {
+			// Update() retries the scan once the runtime import finishes.
+			this.needsScan = true;
+			this.busy = false;
+			this.setStatus("Loading SignalRGB TCP module...");
+			return this.status;
+		}
 		const refreshId = ++this.refreshId;
 		this.busy = true;
 		this.lastAutoAttemptAt = Date.now();
@@ -800,6 +917,14 @@ class OpenRGBClient {
 		}
 		if (Date.now() < this.nextConnectAt) {
 			return;
+		}
+
+		if (!tcp) {
+			loadTcpModule(this.logger);
+			if (tcpLoadState === "loading") {
+				this.nextConnectAt = Date.now() + 250;
+				return;
+			}
 		}
 
 		if (!tcp || typeof tcp.createSocket !== "function") {

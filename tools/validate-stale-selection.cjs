@@ -11,7 +11,7 @@ const qmlSource = fs.readFileSync(qmlPath, "utf8");
 source = source
 	.replace(/^import\s+tcp\s+from\s+"@SignalRGB\/tcp";\s*/m, "")
 	.replace(/\bexport function\b/g, "function");
-source += "\nglobalThis.__bridgeTest = { DiscoveryService, OpenRGBClient, Initialize };\n";
+source += "\nglobalThis.__bridgeTest = { DiscoveryService, OpenRGBClient, Initialize, Render };\n";
 
 const settings = new Map();
 const entries = [];
@@ -203,5 +203,39 @@ const fresh = new context.__bridgeTest.DiscoveryService();
 fresh.needsScan = false;
 runScan(fresh);
 assert.equal(catalogue(fresh)[0].bridgeDeleted, true, "Delete All must persist across restarts");
+
+// ---- Device -> service frame handoff (devices cannot open sockets on 2.5.86) ----
+discovery.restoreAllDevices();
+discovery.Update();
+runScan(discovery);
+const gpuController = announcedControllers[announcedControllers.length - 1];
+Object.assign(context.device, {
+	createSubdevice() {}, setSubdeviceName() {}, setSubdeviceSize() {}, setSubdeviceLeds() {},
+	SetIsSubdeviceController() {}, pause() {},
+	subdeviceColor(id) { return id.endsWith("Logo") ? [255, 0, 0] : [0, 0, 255]; },
+	color() { return [0, 255, 0]; }
+});
+context.controller = gpuController;
+Object.assign(context, { LightingMode: "Canvas", forcedColor: "#009bde", shutdownColor: "#009bde" });
+context.device.log = (m) => { if (String(m).includes("DIAG-DEV")) console.log(String(m).slice(0, 300)); };
+context.__bridgeTest.Initialize();
+context.__bridgeTest.Render();
+assert.equal(typeof gpuController.bridgeFrameSeq, "number", "the device must publish its frame on the controller");
+assert.equal(gpuController.bridgeFrames.length, 1, "both zones belong to one OpenRGB controller");
+assert.equal(JSON.stringify(gpuController.bridgeFrames[0].colors), JSON.stringify([[255, 0, 0], [0, 0, 255]]), "the frame carries each zone's canvas colour");
+
+const socketsBefore = sockets.length;
+discovery.Update();                              // service opens its render connection
+const renderSocket = sockets[sockets.length - 1];
+assert.ok(sockets.length > socketsBefore, "the service must open the render connection, not the device");
+renderSocket.handlers.connection();
+renderSocket.handlers.message(packet(40, u32(6)));
+discovery.Update();                              // ready: custom mode + LED updates go out
+const commands = renderSocket.sent.map((bytes) => bytes[8] | (bytes[9] << 8) | (bytes[10] << 16) | (bytes[11] << 24));
+assert.ok(commands.includes(1100), "the service must switch the GPU to custom mode");
+assert.ok(commands.includes(1050), "the service must send the GPU's LED colours to OpenRGB");
+const sentBefore = renderSocket.sent.length;
+discovery.Update();
+assert.equal(renderSocket.sent.length, sentBefore, "an unchanged frame must not be resent");
 
 console.log("Stale-selection validation passed.");
